@@ -24,6 +24,15 @@ class NotchViewModel: ObservableObject {
     // MARK: - Published Properties
     
     @Published var currentState: NotchState = .idle
+    @Published var mediaInfo: MediaInfo?
+    
+    // MARK: - Managers
+    
+    let mediaManager = MediaManager()
+    
+    // MARK: - Private
+    
+    private var cancellables = Set<AnyCancellable>()
     
     // MARK: - Computed Sizes
     
@@ -47,13 +56,44 @@ class NotchViewModel: ObservableObject {
         }
     }
     
+    // MARK: - Init
+    
+    init() {
+        bindMediaManager()
+    }
+    
+    // MARK: - Bindings
+    
+    private func bindMediaManager() {
+        mediaManager.$mediaInfo
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] info in
+                guard let self = self else { return }
+                
+                // @Published güncellemelerini asenkron yap → SwiftUI render döngüsüyle çakışmasın
+                DispatchQueue.main.async {
+                    self.mediaInfo = info
+                    
+                    if let info = info, info.isPlaying {
+                        // Müzik çalıyorsa → media state'e geç
+                        if self.currentState != .media {
+                            self.currentState = .media
+                        }
+                    } else {
+                        // Medya yoksa veya durdurulduysa → idle'a dön
+                        if self.currentState == .media {
+                            self.currentState = .idle
+                        }
+                    }
+                }
+            }
+            .store(in: &cancellables)
+    }
+    
     // MARK: - Actions
     
-    /// State'ler arası sırayla geçiş yapar (idle → media → progress → notification → idle)
-    func cycleState() {
-        let allCases = NotchState.allCases
-        guard let currentIndex = allCases.firstIndex(of: currentState) else { return }
-        let nextIndex = (currentIndex + 1) % allCases.count
-        currentState = allCases[nextIndex]
+    /// Play/Pause toggle
+    func togglePlayPause() {
+        mediaManager.togglePlayPause()
     }
 }
