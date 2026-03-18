@@ -19,6 +19,14 @@ struct NotchView: View {
                     width: viewModel.notchWidth,
                     height: viewModel.notchHeight
                 )
+                .animation(
+                    .spring(response: 0.4, dampingFraction: 0.6),
+                    value: viewModel.currentState
+                )
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    viewModel.cycleState()
+                }
             
             Spacer()
         }
@@ -29,6 +37,6 @@ struct NotchView: View {
 
 #Preview {
     NotchView()
-        .frame(width: 300, height: 100)
+        .frame(width: 400, height: 120)
         .background(Color.gray.opacity(0.2))
 }
