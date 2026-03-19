@@ -14,7 +14,8 @@ enum NotchState {
     case idle
     case mediaExpanded
     case mediaCollapsed
-    case mediaPausing      // Müzik durdu ama henüz kapanmıyor (2 sn grace period)
+    case mediaPausing         // Müzik durdu ama henüz kapanmıyor (2 sn grace period)
+    case mediaPlayerActive    // Tam açık interaktif player (tıklama ile)
     case progress
     case notification
 }
@@ -37,37 +38,38 @@ class NotchViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var collapseTask: DispatchWorkItem?
     private var pauseDismissTask: DispatchWorkItem?
+    private var playerDismissTask: DispatchWorkItem?
     
-    /// Son alınan şarkı title'ı
     private var lastTrackTitle: String?
-    
-    /// Son bilinen isPlaying durumu (false→true geçişini algılamak için)
     private var wasPlaying: Bool = false
     
     private let collapseDelay: TimeInterval = 3.0
     private let pauseDismissDelay: TimeInterval = 2.0
+    private let playerAutoCloseDelay: TimeInterval = 8.0
     
     // MARK: - Computed Sizes
     
     var notchWidth: CGFloat {
         switch currentState {
-        case .idle:             return 160
-        case .mediaExpanded:    return 300
-        case .mediaCollapsed:   return 260
-        case .mediaPausing:     return 260
-        case .progress:         return 280
-        case .notification:     return 360
+        case .idle:               return 160
+        case .mediaExpanded:      return 300
+        case .mediaCollapsed:     return 260
+        case .mediaPausing:       return 260
+        case .mediaPlayerActive:  return 340
+        case .progress:           return 280
+        case .notification:       return 360
         }
     }
     
     var notchHeight: CGFloat {
         switch currentState {
-        case .idle:             return 32
-        case .mediaExpanded:    return 48
-        case .mediaCollapsed:   return 32
-        case .mediaPausing:     return 32
-        case .progress:         return 40
-        case .notification:     return 56
+        case .idle:               return 32
+        case .mediaExpanded:      return 48
+        case .mediaCollapsed:     return 32
+        case .mediaPausing:       return 32
+        case .mediaPlayerActive:  return 140
+        case .progress:           return 40
+        case .notification:       return 56
         }
     }
     
@@ -95,11 +97,9 @@ class NotchViewModel: ObservableObject {
     // MARK: - Media State Machine
     
     private func handleMediaUpdate(_ info: MediaInfo?) {
-        let previousInfo = self.mediaInfo
         self.mediaInfo = info
         
         guard let info = info else {
-            // Medya tamamen yok → direkt kapat
             cancelAllTimers()
             wasPlaying = false
             if currentState != .idle {
@@ -110,34 +110,42 @@ class NotchViewModel: ObservableObject {
         }
         
         let trackChanged = (info.title != lastTrackTitle)
-        let playResumed = (info.isPlaying && !wasPlaying)   // false → true geçişi
+        let playResumed = (info.isPlaying && !wasPlaying)
         
         lastTrackTitle = info.title
         wasPlaying = info.isPlaying
         
         if info.isPlaying {
-            // ▶ Müzik çalıyor
             cancelPauseDismissTimer()
             
-            // Uyanma koşulları: şarkı değişti VEYA play resume edildi
+            // mediaPlayerActive açıkken state değiştirme — sadece veriyi güncelle
+            if currentState == .mediaPlayerActive {
+                if trackChanged {
+                    // Şarkı değişti — player açık kalsın, auto-close timer sıfırla
+                    resetPlayerAutoCloseTimer()
+                }
+                return
+            }
+            
             let shouldWake = trackChanged || playResumed
             
             if shouldWake {
                 wakeUpNotch()
-            } else {
-                // Aynı şarkı, zaten çalıyor — mevcut state'i koru
-                // (expanded ise expanded, collapsed ise collapsed kalsın)
             }
         } else {
-            // ⏸ Müzik duraklatıldı → mediaPausing state'e geç
+            // ⏸ Müzik duraklatıldı
             cancelCollapseTimer()
+            
+            // Player açıksa açık kalsın (kullanıcı bilerek açtı)
+            if currentState == .mediaPlayerActive {
+                return
+            }
             
             switch currentState {
             case .mediaExpanded, .mediaCollapsed:
                 currentState = .mediaPausing
                 startPauseDismissTimer()
             case .mediaPausing:
-                // Zaten pausing'deyiz, timer devam etsin
                 break
             default:
                 break
@@ -145,14 +153,32 @@ class NotchViewModel: ObservableObject {
         }
     }
     
-    // MARK: - Wake Up (Her türlü durumdan → mediaExpanded → 3 sn → mediaCollapsed)
+    // MARK: - Wake Up
     
-    /// Çentiği uyandırır: expanded'a geçer, 3 saniye sonra collapsed'a döner.
-    /// Şarkı değişikliği veya play resume'da çağrılır.
     func wakeUpNotch() {
         cancelAllTimers()
         currentState = .mediaExpanded
         startCollapseTimer()
+    }
+    
+    // MARK: - Open Player (collapsed tıklama → tam player)
+    
+    func openMediaPlayer() {
+        guard mediaInfo != nil else { return }
+        cancelAllTimers()
+        currentState = .mediaPlayerActive
+        startPlayerAutoCloseTimer()
+    }
+    
+    /// Player'ı kapat → collapsed'a dön
+    func closeMediaPlayer() {
+        cancelPlayerAutoCloseTimer()
+        if mediaInfo?.isPlaying == true {
+            currentState = .mediaCollapsed
+        } else {
+            currentState = .mediaPausing
+            startPauseDismissTimer()
+        }
     }
     
     // MARK: - Collapse Timer (expanded → collapsed, 3 sn)
@@ -195,14 +221,60 @@ class NotchViewModel: ObservableObject {
         pauseDismissTask = nil
     }
     
+    // MARK: - Player Auto-Close Timer (8 sn etkileşim yoksa kapat)
+    
+    private func startPlayerAutoCloseTimer() {
+        cancelPlayerAutoCloseTimer()
+        
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            if self.currentState == .mediaPlayerActive {
+                self.closeMediaPlayer()
+            }
+        }
+        playerDismissTask = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + playerAutoCloseDelay, execute: work)
+    }
+    
+    func resetPlayerAutoCloseTimer() {
+        startPlayerAutoCloseTimer()
+    }
+    
+    private func cancelPlayerAutoCloseTimer() {
+        playerDismissTask?.cancel()
+        playerDismissTask = nil
+    }
+    
     private func cancelAllTimers() {
         cancelCollapseTimer()
         cancelPauseDismissTimer()
+        cancelPlayerAutoCloseTimer()
     }
     
-    // MARK: - Actions
+    // MARK: - Media Control Actions
     
     func togglePlayPause() {
         mediaManager.togglePlayPause()
+        resetPlayerAutoCloseTimer()
+    }
+    
+    func nextTrack() {
+        mediaManager.nextTrack()
+        resetPlayerAutoCloseTimer()
+    }
+    
+    func previousTrack() {
+        mediaManager.previousTrack()
+        resetPlayerAutoCloseTimer()
+    }
+    
+    func skipForward() {
+        mediaManager.skipForward(seconds: 10)
+        resetPlayerAutoCloseTimer()
+    }
+    
+    func skipBackward() {
+        mediaManager.skipBackward(seconds: 10)
+        resetPlayerAutoCloseTimer()
     }
 }

@@ -12,12 +12,14 @@ import AppKit
 // MARK: - MediaSource
 
 /// Medya kaynağı tipi — önceliklendirme için
+/// Spesifik uygulama kaynakları daha yüksek öncelikli (AppleScript/JS kontrolü mümkün)
+/// mediaRemote sadece fallback (kontrol sınırlı)
 enum MediaSource: Int, Comparable {
     case mock = 0
-    case browserTab = 1
-    case appleMusic = 2
-    case spotify = 3
-    case mediaRemote = 4   // Sistem seviyesi (en güncel kaynak)
+    case mediaRemote = 1    // Sistem fallback — sadece Now Playing okur
+    case browserTab = 2
+    case appleMusic = 3
+    case spotify = 4        // En yüksek — tam AppleScript kontrolü
     
     static func < (lhs: MediaSource, rhs: MediaSource) -> Bool {
         return lhs.rawValue < rhs.rawValue
@@ -151,7 +153,7 @@ class MediaManager: ObservableObject {
         mockTimer = nil
     }
     
-    // MARK: - Play/Pause Toggle (Global CGEvent)
+    // MARK: - Play/Pause Toggle (Kaynak Bazlı)
     
     func togglePlayPause() {
         if useMockData {
@@ -165,10 +167,388 @@ class MediaManager: ObservableObject {
             return
         }
         
-        sendMediaKeyEvent(keyType: 16)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let currentSource = self.mediaInfo?.source
+            
+            switch currentSource {
+            case .spotify:
+                if self.isAppRunning("Spotify") {
+                    let script = """
+                    if application "Spotify" is running then
+                        tell application "Spotify" to playpause
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .appleMusic:
+                if self.isAppRunning("Music") {
+                    let script = """
+                    if application "Music" is running then
+                        tell application "Music" to playpause
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .browserTab:
+                self.browserTogglePlayPause(targetTitle: self.mediaInfo?.title)
+                
+            default:
+                self.sendMediaKeyEvent(keyType: 16)
+            }
+            
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) {
+                self.fetchNowPlaying()
+            }
+        }
+    }
+    
+    // MARK: - Next / Previous Track (Kaynak Bazlı)
+    
+    func nextTrack() {
+        if useMockData {
+            advanceMockTrack()
+            return
+        }
         
-        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.fetchNowPlaying()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let currentSource = self.mediaInfo?.source
+            
+            switch currentSource {
+            case .spotify:
+                if self.isAppRunning("Spotify") {
+                    let script = """
+                    if application "Spotify" is running then
+                        tell application "Spotify" to next track
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .appleMusic:
+                if self.isAppRunning("Music") {
+                    let script = """
+                    if application "Music" is running then
+                        tell application "Music" to next track
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .browserTab:
+                // Browser'da next track yok — CGEvent fallback
+                self.sendMediaKeyEvent(keyType: 17)
+                
+            default:
+                self.sendMediaKeyEvent(keyType: 17)
+            }
+            
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.8) {
+                self.fetchNowPlaying()
+            }
+        }
+    }
+    
+    func previousTrack() {
+        if useMockData {
+            mockIndex = (mockIndex - 1 + mockTracks.count) % mockTracks.count
+            showMockTrack()
+            return
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let currentSource = self.mediaInfo?.source
+            
+            switch currentSource {
+            case .spotify:
+                if self.isAppRunning("Spotify") {
+                    let script = """
+                    if application "Spotify" is running then
+                        tell application "Spotify" to previous track
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .appleMusic:
+                if self.isAppRunning("Music") {
+                    let script = """
+                    if application "Music" is running then
+                        tell application "Music" to previous track
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .browserTab:
+                self.sendMediaKeyEvent(keyType: 18)
+                
+            default:
+                self.sendMediaKeyEvent(keyType: 18)
+            }
+            
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.8) {
+                self.fetchNowPlaying()
+            }
+        }
+    }
+    
+    // MARK: - Browser Play/Pause (JavaScript Injection — Target-Specific)
+    
+    /// targetTitle: Şu an gösterilen medyanın başlığı. Sadece başlığı eşleşen sekmeye müdahale eder.
+    private func browserTogglePlayPause(targetTitle: String?) {
+        let toggleJS = """
+        (function() {
+            var elems = document.querySelectorAll('video, audio');
+            for (var i = 0; i < elems.length; i++) {
+                if (elems[i].duration > 0) {
+                    if (elems[i].paused) { elems[i].play(); } else { elems[i].pause(); }
+                    return 'OK';
+                }
+            }
+            return 'NO_MEDIA';
+        })();
+        """
+        
+        let escapedTitle = escapeForAppleScript(targetTitle ?? "")
+        let hasTarget = !(targetTitle ?? "").isEmpty
+        
+        let chromiumBrowsers = ["Google Chrome", "Brave Browser", "Microsoft Edge", "Arc", "Opera"]
+        
+        for appName in chromiumBrowsers {
+            guard isAppRunning(appName) else { continue }
+            
+            let titleCheck = hasTarget
+                ? "if title of currentTab contains \"\(escapedTitle)\" then"
+                : "if true then"  // targetTitle yoksa fallback: hepsine bak
+            let titleEnd = "end if"
+            
+            let script = """
+            if application "\(appName)" is running then
+                tell application "\(appName)"
+                    set windowCount to count of windows
+                    repeat with w from 1 to windowCount
+                        set tabCount to count of tabs of window w
+                        repeat with t from 1 to tabCount
+                            try
+                                set currentTab to tab t of window w
+                                \(titleCheck)
+                                    set jsResult to execute currentTab javascript "\(toggleJS)"
+                                    if jsResult is "OK" then return "DONE"
+                                \(titleEnd)
+                            end try
+                        end repeat
+                    end repeat
+                end tell
+            end if
+            """
+            if let result = runAppleScript(script), result == "DONE" { return }
+        }
+        
+        // Safari
+        if isAppRunning("Safari") {
+            let titleCheck = hasTarget
+                ? "if name of currentTab contains \"\(escapedTitle)\" then"
+                : "if true then"
+            let titleEnd = "end if"
+            
+            let script = """
+            if application "Safari" is running then
+                tell application "Safari"
+                    set windowCount to count of windows
+                    repeat with w from 1 to windowCount
+                        set tabCount to count of tabs of window w
+                        repeat with t from 1 to tabCount
+                            try
+                                set currentTab to tab t of window w
+                                \(titleCheck)
+                                    set jsResult to do JavaScript "\(toggleJS)" in currentTab
+                                    if jsResult is "OK" then return "DONE"
+                                \(titleEnd)
+                            end try
+                        end repeat
+                    end repeat
+                end tell
+            end if
+            """
+            _ = runAppleScript(script)
+        }
+    }
+    
+    // MARK: - Skip Forward / Backward (Kaynak Bazlı)
+    
+    /// 10 saniye ileri sar
+    func skipForward(seconds: Int = 10) {
+        if useMockData { return }
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let currentSource = self.mediaInfo?.source
+            
+            switch currentSource {
+            case .spotify:
+                if self.isAppRunning("Spotify") {
+                    let script = """
+                    if application "Spotify" is running then
+                        tell application "Spotify"
+                            set player position to (player position + \(seconds))
+                        end tell
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .appleMusic:
+                if self.isAppRunning("Music") {
+                    let script = """
+                    if application "Music" is running then
+                        tell application "Music"
+                            set player position to (player position + \(seconds))
+                        end tell
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .browserTab:
+                self.browserSeek(seconds: seconds, targetTitle: self.mediaInfo?.title)
+                
+            default:
+                // MediaRemote veya bilinmeyen kaynak — CGEvent Fast Forward
+                self.sendMediaKeyEvent(keyType: 19)
+            }
+        }
+    }
+    
+    /// 10 saniye geri sar
+    func skipBackward(seconds: Int = 10) {
+        if useMockData { return }
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let currentSource = self.mediaInfo?.source
+            
+            switch currentSource {
+            case .spotify:
+                if self.isAppRunning("Spotify") {
+                    let script = """
+                    if application "Spotify" is running then
+                        tell application "Spotify"
+                            set newPos to (player position - \(seconds))
+                            if newPos < 0 then set newPos to 0
+                            set player position to newPos
+                        end tell
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .appleMusic:
+                if self.isAppRunning("Music") {
+                    let script = """
+                    if application "Music" is running then
+                        tell application "Music"
+                            set newPos to (player position - \(seconds))
+                            if newPos < 0 then set newPos to 0
+                            set player position to newPos
+                        end tell
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .browserTab:
+                self.browserSeek(seconds: -seconds, targetTitle: self.mediaInfo?.title)
+                
+            default:
+                self.sendMediaKeyEvent(keyType: 20)
+            }
+        }
+    }
+    
+    // MARK: - Browser Seek (JavaScript Injection — Target-Specific)
+    
+    /// Tarayıcılardaki video/audio elementini seek eder — sadece targetTitle ile eşleşen sekmede
+    private func browserSeek(seconds: Int, targetTitle: String?) {
+        let seekJS = """
+        (function() {
+            var elems = document.querySelectorAll('video, audio');
+            for (var i = 0; i < elems.length; i++) {
+                if (elems[i].duration > 0) {
+                    elems[i].currentTime += \(seconds);
+                    return 'OK';
+                }
+            }
+            return 'NO_MEDIA';
+        })();
+        """
+        
+        let escapedTitle = escapeForAppleScript(targetTitle ?? "")
+        let hasTarget = !(targetTitle ?? "").isEmpty
+        
+        let chromiumBrowsers = ["Google Chrome", "Brave Browser", "Microsoft Edge", "Arc", "Opera"]
+        
+        for appName in chromiumBrowsers {
+            guard isAppRunning(appName) else { continue }
+            
+            let titleCheck = hasTarget
+                ? "if title of currentTab contains \"\(escapedTitle)\" then"
+                : "if true then"
+            let titleEnd = "end if"
+            
+            let script = """
+            if application "\(appName)" is running then
+                tell application "\(appName)"
+                    set windowCount to count of windows
+                    repeat with w from 1 to windowCount
+                        set tabCount to count of tabs of window w
+                        repeat with t from 1 to tabCount
+                            try
+                                set currentTab to tab t of window w
+                                \(titleCheck)
+                                    set jsResult to execute currentTab javascript "\(seekJS)"
+                                    if jsResult is "OK" then return "DONE"
+                                \(titleEnd)
+                            end try
+                        end repeat
+                    end repeat
+                end tell
+            end if
+            """
+            if let result = runAppleScript(script), result == "DONE" { return }
+        }
+        
+        // Safari
+        if isAppRunning("Safari") {
+            let titleCheck = hasTarget
+                ? "if name of currentTab contains \"\(escapedTitle)\" then"
+                : "if true then"
+            let titleEnd = "end if"
+            
+            let script = """
+            if application "Safari" is running then
+                tell application "Safari"
+                    set windowCount to count of windows
+                    repeat with w from 1 to windowCount
+                        set tabCount to count of tabs of window w
+                        repeat with t from 1 to tabCount
+                            try
+                                set currentTab to tab t of window w
+                                \(titleCheck)
+                                    set jsResult to do JavaScript "\(seekJS)" in currentTab
+                                    if jsResult is "OK" then return "DONE"
+                                \(titleEnd)
+                            end try
+                        end repeat
+                    end repeat
+                end tell
+            end if
+            """
+            _ = runAppleScript(script)
         }
     }
     
@@ -631,6 +1011,16 @@ class MediaManager: ObservableObject {
         
         // Bundle ID yoksa localizedName ile kontrol et
         return runningApps.contains { $0.localizedName == appName }
+    }
+    
+    // MARK: - AppleScript String Escaping
+    
+    /// AppleScript string literal'lerini bozan karakterleri escape eder.
+    /// `\` → `\\`, `"` → `\"` dönüşümü yapar.
+    private func escapeForAppleScript(_ text: String) -> String {
+        return text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
     
     // MARK: - AppleScript Runner
