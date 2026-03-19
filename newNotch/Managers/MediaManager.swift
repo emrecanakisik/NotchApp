@@ -9,12 +9,28 @@ import Foundation
 import Combine
 import AppKit
 
+// MARK: - MediaSource
+
+/// Medya kaynağı tipi — önceliklendirme için
+enum MediaSource: Int, Comparable {
+    case mock = 0
+    case browserTab = 1
+    case appleMusic = 2
+    case spotify = 3
+    case mediaRemote = 4   // Sistem seviyesi (en güncel kaynak)
+    
+    static func < (lhs: MediaSource, rhs: MediaSource) -> Bool {
+        return lhs.rawValue < rhs.rawValue
+    }
+}
+
 // MARK: - MediaInfo
 
 struct MediaInfo {
     var title: String
     var artist: String
     var isPlaying: Bool
+    var source: MediaSource
 }
 
 // MARK: - MediaManager
@@ -30,7 +46,12 @@ class MediaManager: ObservableObject {
     private var pollTimer: Timer?
     private let pollInterval: TimeInterval = 2.0
     
-    /// Mock modu aktif mi? (AppleScript erişimi yoksa true yap)
+    /// MediaRemote function pointers
+    private var MRMediaRemoteGetNowPlayingInfo: (@convention(c) (DispatchQueue, @escaping ([String: Any]) -> Void) -> Void)?
+    private var MRMediaRemoteGetNowPlayingApplicationIsPlaying: (@convention(c) (DispatchQueue, @escaping (Bool) -> Void) -> Void)?
+    private var mediaRemoteLoaded = false
+    
+    /// Mock modu
     private var useMockData = false
     private var mockTimer: Timer?
     private var mockIndex = 0
@@ -43,10 +64,30 @@ class MediaManager: ObservableObject {
         ("As It Was", "Harry Styles")
     ]
     
+    /// Uygulama adı → Bundle ID eşleştirmesi (çalışıyor mu kontrolü için)
+    private let appBundleIDs: [String: String] = [
+        "Spotify":          "com.spotify.client",
+        "Music":            "com.apple.Music",
+        "Google Chrome":    "com.google.Chrome",
+        "Brave Browser":    "com.brave.Browser",
+        "Microsoft Edge":   "com.microsoft.edgemac",
+        "Arc":              "company.thebrowser.Browser",
+        "Opera":            "com.operasoftware.Opera",
+        "Safari":           "com.apple.Safari"
+    ]
+    
+    // MARK: - MediaRemote Keys (Private API)
+    
+    private let kMRMediaRemoteNowPlayingInfoTitle = "kMRMediaRemoteNowPlayingInfoTitle"
+    private let kMRMediaRemoteNowPlayingInfoArtist = "kMRMediaRemoteNowPlayingInfoArtist"
+    private let kMRMediaRemoteNowPlayingInfoAlbum = "kMRMediaRemoteNowPlayingInfoAlbum"
+    private let kMRMediaRemoteNowPlayingInfoPlaybackRate = "kMRMediaRemoteNowPlayingInfoPlaybackRate"
+    
     // MARK: - Init
     
     init() {
-        // View çizimi tamamlansın diye polling'i geciktir
+        loadMediaRemoteFramework()
+        
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.startPolling()
         }
@@ -56,15 +97,46 @@ class MediaManager: ObservableObject {
         stopPolling()
     }
     
+    // MARK: - MediaRemote Framework Loading
+    
+    private func loadMediaRemoteFramework() {
+        let path = "/System/Library/PrivateFrameworks/MediaRemote.framework/MediaRemote"
+        
+        guard let handle = dlopen(path, RTLD_NOW) else {
+            print("[MediaManager] MediaRemote.framework yüklenemedi, fallback kullanılacak")
+            return
+        }
+        
+        if let sym = dlsym(handle, "MRMediaRemoteGetNowPlayingInfo") {
+            MRMediaRemoteGetNowPlayingInfo = unsafeBitCast(
+                sym,
+                to: (@convention(c) (DispatchQueue, @escaping ([String: Any]) -> Void) -> Void).self
+            )
+        }
+        
+        if let sym = dlsym(handle, "MRMediaRemoteGetNowPlayingApplicationIsPlaying") {
+            MRMediaRemoteGetNowPlayingApplicationIsPlaying = unsafeBitCast(
+                sym,
+                to: (@convention(c) (DispatchQueue, @escaping (Bool) -> Void) -> Void).self
+            )
+        }
+        
+        mediaRemoteLoaded = (MRMediaRemoteGetNowPlayingInfo != nil)
+        
+        if mediaRemoteLoaded {
+            print("[MediaManager] ✅ MediaRemote.framework başarıyla yüklendi")
+        } else {
+            print("[MediaManager] ⚠️ MediaRemote fonksiyonları bulunamadı, fallback kullanılacak")
+        }
+    }
+    
     // MARK: - Polling
     
     func startPolling() {
-        // İlk sorgulamayı arka planda yap
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.fetchNowPlaying()
         }
         
-        // Periyodik sorgulama
         pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
             DispatchQueue.global(qos: .userInitiated).async {
                 self?.fetchNowPlaying()
@@ -79,11 +151,10 @@ class MediaManager: ObservableObject {
         mockTimer = nil
     }
     
-    // MARK: - Play/Pause Toggle
+    // MARK: - Play/Pause Toggle (Global CGEvent)
     
     func togglePlayPause() {
         if useMockData {
-            // Mock: sadece isPlaying durumunu tersle
             if var info = mediaInfo {
                 info.isPlaying.toggle()
                 let updated = info
@@ -94,63 +165,94 @@ class MediaManager: ObservableObject {
             return
         }
         
-        // Önce Spotify'ı dene, sonra Apple Music
-        let spotifyScript = """
-        tell application "System Events"
-            if exists (processes where name is "Spotify") then
-                tell application "Spotify" to playpause
-                return true
-            end if
-        end tell
-        return false
-        """
+        sendMediaKeyEvent(keyType: 16)
         
-        if let result = runAppleScript(spotifyScript), result != "false" {
-            // Spotify bulundu, komut gönderildi
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.fetchNowPlaying()
-            }
-            return
-        }
-        
-        let musicScript = """
-        tell application "System Events"
-            if exists (processes where name is "Music") then
-                tell application "Music" to playpause
-                return true
-            end if
-        end tell
-        return false
-        """
-        
-        _ = runAppleScript(musicScript)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.fetchNowPlaying()
         }
     }
     
-    // MARK: - Fetch Now Playing
+    // MARK: - CGEvent Media Key Simulation
+    
+    private func sendMediaKeyEvent(keyType: Int) {
+        let NX_KEYTYPE = keyType
+        
+        let keyDown = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: 0xa00),
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: (NX_KEYTYPE << 16) | (0xa << 8),
+            data2: -1
+        )
+        
+        let keyUp = NSEvent.otherEvent(
+            with: .systemDefined,
+            location: .zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: 0xb00),
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            subtype: 8,
+            data1: (NX_KEYTYPE << 16) | (0xb << 8),
+            data2: -1
+        )
+        
+        if let downEvent = keyDown?.cgEvent {
+            downEvent.post(tap: .cghidEventTap)
+        }
+        if let upEvent = keyUp?.cgEvent {
+            upEvent.post(tap: .cghidEventTap)
+        }
+    }
+    
+    // MARK: - Fetch Now Playing (Son Çalan Kazanır — Active Override)
     
     private func fetchNowPlaying() {
-        // Spotify'ı kontrol et
+        var candidates: [MediaInfo] = []
+        
+        // 1️⃣ MediaRemote (sistem seviyesi — global)
+        if mediaRemoteLoaded {
+            if let info = fetchFromMediaRemoteSync() {
+                candidates.append(info)
+            }
+        }
+        
+        // 2️⃣ Spotify (native)
         if let info = fetchFromSpotify() {
-            DispatchQueue.main.async { [weak self] in
-                self?.useMockData = false
-                self?.mediaInfo = info
-            }
-            return
+            candidates.append(info)
         }
         
-        // Apple Music'i kontrol et
+        // 3️⃣ Apple Music (native)
         if let info = fetchFromAppleMusic() {
-            DispatchQueue.main.async { [weak self] in
-                self?.useMockData = false
-                self?.mediaInfo = info
-            }
+            candidates.append(info)
+        }
+        
+        // 4️⃣ Browser tabs (Chromium + Safari)
+        if let info = fetchFromBrowserTabs() {
+            candidates.append(info)
+        }
+        
+        // --- SON ÇALAN KAZANIR (Active Override) ---
+        // Playing olanlar arasından en yüksek öncelikli kaynağı seç
+        let playingCandidates = candidates.filter { $0.isPlaying }
+        
+        if let winner = playingCandidates.max(by: { $0.source < $1.source }) {
+            // Çalan var → onu göster
+            updateMediaInfo(winner)
             return
         }
         
-        // Hiçbir müzik uygulaması aktif değilse → mock moda geç
+        // Hiçbiri çalmıyor → en yüksek öncelikli paused kaynağı göster (eğer varsa)
+        if let pausedWinner = candidates.max(by: { $0.source < $1.source }) {
+            updateMediaInfo(pausedWinner)
+            return
+        }
+        
+        // Hiçbir kaynak bulunamadı → mock moda geç
         if !useMockData {
             useMockData = true
             DispatchQueue.main.async { [weak self] in
@@ -159,28 +261,73 @@ class MediaManager: ObservableObject {
         }
     }
     
+    private func updateMediaInfo(_ info: MediaInfo) {
+        DispatchQueue.main.async { [weak self] in
+            self?.useMockData = false
+            self?.mockTimer?.invalidate()
+            self?.mockTimer = nil
+            self?.mediaInfo = info
+        }
+    }
+    
+    // MARK: - MediaRemote (Private API — Senkron Wrapper)
+    
+    private func fetchFromMediaRemoteSync() -> MediaInfo? {
+        guard let getInfo = MRMediaRemoteGetNowPlayingInfo else { return nil }
+        
+        let semaphore = DispatchSemaphore(value: 0)
+        var fetchedInfo: MediaInfo?
+        
+        getInfo(DispatchQueue.global(qos: .userInitiated)) { [weak self] dict in
+            guard let self = self else {
+                semaphore.signal()
+                return
+            }
+            
+            let title = dict[self.kMRMediaRemoteNowPlayingInfoTitle] as? String
+            let artist = dict[self.kMRMediaRemoteNowPlayingInfoArtist] as? String
+            let playbackRate = dict[self.kMRMediaRemoteNowPlayingInfoPlaybackRate] as? Double
+            
+            if let title = title, !title.isEmpty {
+                fetchedInfo = MediaInfo(
+                    title: title,
+                    artist: artist ?? "",
+                    isPlaying: (playbackRate ?? 0) > 0,
+                    source: .mediaRemote
+                )
+            }
+            
+            semaphore.signal()
+        }
+        
+        let result = semaphore.wait(timeout: .now() + 2.0)
+        return result == .success ? fetchedInfo : nil
+    }
+    
     // MARK: - Spotify AppleScript
     
     private func fetchFromSpotify() -> MediaInfo? {
+        // 🛡️ Swift tarafında kontrol: Spotify açık mı?
+        guard isAppRunning("Spotify") else { return nil }
+        
         let script = """
-        tell application "System Events"
-            if not (exists (processes where name is "Spotify")) then
-                return "NOT_RUNNING"
-            end if
-        end tell
-        tell application "Spotify"
-            if player state is playing then
-                set trackName to name of current track
-                set trackArtist to artist of current track
-                return trackName & "|||" & trackArtist & "|||PLAYING"
-            else if player state is paused then
-                set trackName to name of current track
-                set trackArtist to artist of current track
-                return trackName & "|||" & trackArtist & "|||PAUSED"
-            else
-                return "NO_TRACK"
-            end if
-        end tell
+        if application "Spotify" is running then
+            tell application "Spotify"
+                if player state is playing then
+                    set trackName to name of current track
+                    set trackArtist to artist of current track
+                    return trackName & "|||" & trackArtist & "|||PLAYING"
+                else if player state is paused then
+                    set trackName to name of current track
+                    set trackArtist to artist of current track
+                    return trackName & "|||" & trackArtist & "|||PAUSED"
+                else
+                    return "NO_TRACK"
+                end if
+            end tell
+        else
+            return "NOT_RUNNING"
+        end if
         """
         
         guard let result = runAppleScript(script),
@@ -195,32 +342,35 @@ class MediaManager: ObservableObject {
         return MediaInfo(
             title: parts[0],
             artist: parts[1],
-            isPlaying: parts[2] == "PLAYING"
+            isPlaying: parts[2] == "PLAYING",
+            source: .spotify
         )
     }
     
     // MARK: - Apple Music AppleScript
     
     private func fetchFromAppleMusic() -> MediaInfo? {
+        // 🛡️ Swift tarafında kontrol: Music açık mı?
+        guard isAppRunning("Music") else { return nil }
+        
         let script = """
-        tell application "System Events"
-            if not (exists (processes where name is "Music")) then
-                return "NOT_RUNNING"
-            end if
-        end tell
-        tell application "Music"
-            if player state is playing then
-                set trackName to name of current track
-                set trackArtist to artist of current track
-                return trackName & "|||" & trackArtist & "|||PLAYING"
-            else if player state is paused then
-                set trackName to name of current track
-                set trackArtist to artist of current track
-                return trackName & "|||" & trackArtist & "|||PAUSED"
-            else
-                return "NO_TRACK"
-            end if
-        end tell
+        if application "Music" is running then
+            tell application "Music"
+                if player state is playing then
+                    set trackName to name of current track
+                    set trackArtist to artist of current track
+                    return trackName & "|||" & trackArtist & "|||PLAYING"
+                else if player state is paused then
+                    set trackName to name of current track
+                    set trackArtist to artist of current track
+                    return trackName & "|||" & trackArtist & "|||PAUSED"
+                else
+                    return "NO_TRACK"
+                end if
+            end tell
+        else
+            return "NOT_RUNNING"
+        end if
         """
         
         guard let result = runAppleScript(script),
@@ -235,17 +385,216 @@ class MediaManager: ObservableObject {
         return MediaInfo(
             title: parts[0],
             artist: parts[1],
-            isPlaying: parts[2] == "PLAYING"
+            isPlaying: parts[2] == "PLAYING",
+            source: .appleMusic
+        )
+    }
+    
+    // MARK: - Browser Media Detection (JavaScript Injection)
+    
+    /// JavaScript kodu: Sayfadaki tüm video/audio elementlerini tarayıp oynatma durumunu döndürür
+    private let mediaDetectionJS = "(function(){ var elems = document.querySelectorAll('video, audio'); for(var i=0; i<elems.length; i++){ if(!elems[i].paused && elems[i].duration > 0) return 'PLAYING'; } if(elems.length > 0) return 'PAUSED'; return 'NO_MEDIA'; })();"
+    
+    private func fetchFromBrowserTabs() -> MediaInfo? {
+        let chromiumBrowsers = [
+            "Google Chrome",
+            "Brave Browser",
+            "Microsoft Edge",
+            "Arc",
+            "Opera"
+        ]
+        
+        // 🛡️ Sadece açık olan tarayıcıları sorgula
+        for appName in chromiumBrowsers {
+            guard isAppRunning(appName) else { continue }
+            if let info = fetchFromChromiumBrowser(appName: appName) {
+                return info
+            }
+        }
+        
+        // Safari (farklı AppleScript API)
+        if isAppRunning("Safari"), let info = fetchFromSafari() {
+            return info
+        }
+        
+        return nil
+    }
+    
+    // MARK: - Chromium Browsers (Chrome, Brave, Edge, Arc, Opera)
+    
+    /// Tüm pencere ve sekmeleri gezerek JavaScript ile HTML5 media durumunu kontrol eder.
+    /// Playing bulursa o sekmenin başlığını döndürür.
+    private func fetchFromChromiumBrowser(appName: String) -> MediaInfo? {
+        // Tüm sekmeleri tara, playing olan varsa title + state döndür
+        let script = """
+        if application "\(appName)" is running then
+            tell application "\(appName)"
+                set windowCount to count of windows
+                if windowCount is 0 then return "NO_MEDIA|||none|||NO_MEDIA"
+                
+                -- Önce playing olan sekmeyi ara
+                repeat with w from 1 to windowCount
+                    set tabCount to count of tabs of window w
+                    repeat with t from 1 to tabCount
+                        set currentTab to tab t of window w
+                        try
+                            set jsResult to execute currentTab javascript "\(mediaDetectionJS)"
+                            if jsResult is "PLAYING" then
+                                set tabTitle to title of currentTab
+                                return tabTitle & "|||" & "PLAYING"
+                            end if
+                        end try
+                    end repeat
+                end repeat
+                
+                -- Playing yok, paused olan var mı?
+                repeat with w from 1 to windowCount
+                    set tabCount to count of tabs of window w
+                    repeat with t from 1 to tabCount
+                        set currentTab to tab t of window w
+                        try
+                            set jsResult to execute currentTab javascript "\(mediaDetectionJS)"
+                            if jsResult is "PAUSED" then
+                                set tabTitle to title of currentTab
+                                return tabTitle & "|||" & "PAUSED"
+                            end if
+                        end try
+                    end repeat
+                end repeat
+                
+                return "NO_MEDIA|||none|||NO_MEDIA"
+            end tell
+        else
+            return "NOT_RUNNING|||none|||NOT_RUNNING"
+        end if
+        """
+        
+        guard let result = runAppleScript(script),
+              !result.contains("NOT_RUNNING"),
+              !result.contains("NO_MEDIA") else {
+            return nil
+        }
+        
+        return parseBrowserJSResult(result)
+    }
+    
+    // MARK: - Safari (Farklı AppleScript API — do JavaScript)
+    
+    private func fetchFromSafari() -> MediaInfo? {
+        let script = """
+        if application "Safari" is running then
+            tell application "Safari"
+                set windowCount to count of windows
+                if windowCount is 0 then return "NO_MEDIA|||NO_MEDIA"
+                
+                -- Önce playing olan sekmeyi ara
+                repeat with w from 1 to windowCount
+                    set tabCount to count of tabs of window w
+                    repeat with t from 1 to tabCount
+                        set currentTab to tab t of window w
+                        try
+                            set jsResult to do JavaScript "\(mediaDetectionJS)" in currentTab
+                            if jsResult is "PLAYING" then
+                                set tabTitle to name of currentTab
+                                return tabTitle & "|||" & "PLAYING"
+                            end if
+                        end try
+                    end repeat
+                end repeat
+                
+                -- Playing yok, paused olan var mı?
+                repeat with w from 1 to windowCount
+                    set tabCount to count of tabs of window w
+                    repeat with t from 1 to tabCount
+                        set currentTab to tab t of window w
+                        try
+                            set jsResult to do JavaScript "\(mediaDetectionJS)" in currentTab
+                            if jsResult is "PAUSED" then
+                                set tabTitle to name of currentTab
+                                return tabTitle & "|||" & "PAUSED"
+                            end if
+                        end try
+                    end repeat
+                end repeat
+                
+                return "NO_MEDIA|||NO_MEDIA"
+            end tell
+        else
+            return "NOT_RUNNING|||NOT_RUNNING"
+        end if
+        """
+        
+        guard let result = runAppleScript(script),
+              !result.contains("NOT_RUNNING"),
+              !result.contains("NO_MEDIA") else {
+            return nil
+        }
+        
+        return parseBrowserJSResult(result)
+    }
+    
+    // MARK: - Browser Result Parser
+    
+    /// "Tab Title|||PLAYING" veya "Tab Title|||PAUSED" formatını parse eder
+    private func parseBrowserJSResult(_ result: String) -> MediaInfo? {
+        let parts = result.components(separatedBy: "|||")
+        guard parts.count >= 2 else { return nil }
+        
+        let rawTitle = parts[0]
+        let state = parts[1]
+        let isPlaying = (state == "PLAYING")
+        
+        // Tab başlığından şarkı/sanatçı bilgisini çıkar
+        let parsed = parseMediaTitle(rawTitle)
+        
+        return MediaInfo(
+            title: parsed.title,
+            artist: parsed.artist,
+            isPlaying: isPlaying,
+            source: .browserTab
+        )
+    }
+    
+    /// Tab başlığından şarkı adı ve sanatçı bilgisini ayıklar
+    private func parseMediaTitle(_ title: String) -> (title: String, artist: String) {
+        var cleanTitle = title
+        
+        // Sondaki platform isimlerini temizle
+        let suffixes = [" - YouTube", " - YouTube Music", " | Spotify",
+                       " — Spotify — Web Player", " - SoundCloud",
+                       " | Apple Music", " - Deezer", " | TIDAL",
+                       " - Vimeo", " | Bandcamp", " | Pandora"]
+        for suffix in suffixes {
+            if cleanTitle.hasSuffix(suffix) {
+                cleanTitle = String(cleanTitle.dropLast(suffix.count))
+                break
+            }
+        }
+        
+        // "Şarkı - Sanatçı" formatını ayır
+        let separators = [" - ", " — ", " • ", " | "]
+        for separator in separators {
+            let parts = cleanTitle.components(separatedBy: separator)
+            if parts.count >= 2 {
+                return (
+                    title: parts[0].trimmingCharacters(in: .whitespaces),
+                    artist: parts[1].trimmingCharacters(in: .whitespaces)
+                )
+            }
+        }
+        
+        // Ayıraç bulunamadı
+        return (
+            title: cleanTitle.trimmingCharacters(in: .whitespaces),
+            artist: "Web"
         )
     }
     
     // MARK: - Mock Mode
     
     private func startMockMode() {
-        // Hemen ilk mock veriyi göster
         showMockTrack()
         
-        // Her 5 saniyede yeni mock şarkıya geç
         mockTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
             self?.advanceMockTrack()
         }
@@ -257,7 +606,8 @@ class MediaManager: ObservableObject {
             self?.mediaInfo = MediaInfo(
                 title: track.0,
                 artist: track.1,
-                isPlaying: true
+                isPlaying: true,
+                source: .mock
             )
         }
     }
@@ -265,6 +615,22 @@ class MediaManager: ObservableObject {
     private func advanceMockTrack() {
         mockIndex = (mockIndex + 1) % mockTracks.count
         showMockTrack()
+    }
+    
+    // MARK: - Running App Check (NSWorkspace)
+    
+    /// Uygulama adı ile bundle ID eşleştirmesi yaparak o an çalışıp çalışmadığını kontrol eder.
+    /// Eğer bundle ID eşleştirmesi yoksa, process adı ile kontrol eder.
+    private func isAppRunning(_ appName: String) -> Bool {
+        let runningApps = NSWorkspace.shared.runningApplications
+        
+        // Önce bundle ID ile kontrol et (en güvenilir)
+        if let bundleID = appBundleIDs[appName] {
+            return runningApps.contains { $0.bundleIdentifier == bundleID }
+        }
+        
+        // Bundle ID yoksa localizedName ile kontrol et
+        return runningApps.contains { $0.localizedName == appName }
     }
     
     // MARK: - AppleScript Runner
