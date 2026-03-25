@@ -42,6 +42,7 @@ class MediaManager: ObservableObject {
     // MARK: - Published Properties
     
     @Published var mediaInfo: MediaInfo?
+    @Published var lastKnownMedia: MediaInfo?
     
     // MARK: - Private Properties
     
@@ -647,6 +648,10 @@ class MediaManager: ObservableObject {
             self?.mockTimer?.invalidate()
             self?.mockTimer = nil
             self?.mediaInfo = info
+            // Son bilinen medyayı sakla — idle expanded'da gösterilecek
+            if info.source != .mock {
+                self?.lastKnownMedia = info
+            }
         }
     }
     

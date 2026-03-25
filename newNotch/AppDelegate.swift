@@ -27,11 +27,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Ana ekranı al
         guard let screen = NSScreen.main else { return }
         
-        // Panel boyutları (en büyük state olan notification'a göre ayarlanmış)
-        let panelWidth: CGFloat = 400
-        let panelHeight: CGFloat = 70
+        // Panel boyutları (en büyük state: mediaPlayerActive 350×200 + safe zone padding)
+        let panelWidth: CGFloat = 500
+        let panelHeight: CGFloat = 300
         
-        // Ekranın üst ortasına konumlandır
+        // Ekranın üst ortasına konumlandır (fiziksel çentikle hizalı)
         let originX = screen.frame.midX - (panelWidth / 2)
         let originY = screen.frame.maxY - panelHeight
         
