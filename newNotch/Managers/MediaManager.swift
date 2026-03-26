@@ -49,6 +49,12 @@ class MediaManager: ObservableObject {
     private var pollTimer: Timer?
     private let pollInterval: TimeInterval = 2.0
     
+    /// Tek Şeritli Yol — tüm medya sorguları bu seri kuyrukta çalışır
+    private let pollQueue = DispatchQueue(label: "com.newNotch.mediaPollQueue", qos: .userInitiated)
+    
+    /// Trafik Polisi — önceki tarama bitmeden yenisi başlamasın
+    private var isFetching = false
+    
     /// MediaRemote function pointers
     private var MRMediaRemoteGetNowPlayingInfo: (@convention(c) (DispatchQueue, @escaping ([String: Any]) -> Void) -> Void)?
     private var MRMediaRemoteGetNowPlayingApplicationIsPlaying: (@convention(c) (DispatchQueue, @escaping (Bool) -> Void) -> Void)?
@@ -136,13 +142,20 @@ class MediaManager: ObservableObject {
     // MARK: - Polling
     
     func startPolling() {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.fetchNowPlaying()
+        pollQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.isFetching = true
+            self.fetchNowPlaying()
+            self.isFetching = false
         }
         
         pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            DispatchQueue.global(qos: .userInitiated).async {
-                self?.fetchNowPlaying()
+            self?.pollQueue.async {
+                guard let self = self else { return }
+                guard !self.isFetching else { return }
+                self.isFetching = true
+                defer { self.isFetching = false }
+                self.fetchNowPlaying()
             }
         }
     }
@@ -168,7 +181,7 @@ class MediaManager: ObservableObject {
             return
         }
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        pollQueue.async { [weak self] in
             guard let self = self else { return }
             let currentSource = self.mediaInfo?.source
             
@@ -200,7 +213,7 @@ class MediaManager: ObservableObject {
                 self.sendMediaKeyEvent(keyType: 16)
             }
             
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.5) {
+            self.pollQueue.asyncAfter(deadline: .now() + 0.5) {
                 self.fetchNowPlaying()
             }
         }
@@ -214,7 +227,7 @@ class MediaManager: ObservableObject {
             return
         }
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        pollQueue.async { [weak self] in
             guard let self = self else { return }
             let currentSource = self.mediaInfo?.source
             
@@ -247,7 +260,7 @@ class MediaManager: ObservableObject {
                 self.sendMediaKeyEvent(keyType: 17)
             }
             
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.8) {
+            self.pollQueue.asyncAfter(deadline: .now() + 0.8) {
                 self.fetchNowPlaying()
             }
         }
@@ -260,7 +273,7 @@ class MediaManager: ObservableObject {
             return
         }
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        pollQueue.async { [weak self] in
             guard let self = self else { return }
             let currentSource = self.mediaInfo?.source
             
@@ -292,7 +305,7 @@ class MediaManager: ObservableObject {
                 self.sendMediaKeyEvent(keyType: 18)
             }
             
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.8) {
+            self.pollQueue.asyncAfter(deadline: .now() + 0.8) {
                 self.fetchNowPlaying()
             }
         }
@@ -386,7 +399,7 @@ class MediaManager: ObservableObject {
     func skipForward(seconds: Int = 10) {
         if useMockData { return }
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        pollQueue.async { [weak self] in
             guard let self = self else { return }
             let currentSource = self.mediaInfo?.source
             
@@ -429,7 +442,7 @@ class MediaManager: ObservableObject {
     func skipBackward(seconds: Int = 10) {
         if useMockData { return }
         
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        pollQueue.async { [weak self] in
             guard let self = self else { return }
             let currentSource = self.mediaInfo?.source
             
@@ -685,7 +698,7 @@ class MediaManager: ObservableObject {
             semaphore.signal()
         }
         
-        let result = semaphore.wait(timeout: .now() + 2.0)
+        let result = semaphore.wait(timeout: .now() + 0.5)
         return result == .success ? fetchedInfo : nil
     }
     
