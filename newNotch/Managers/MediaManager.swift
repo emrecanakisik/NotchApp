@@ -28,11 +28,18 @@ enum MediaSource: Int, Comparable {
 
 // MARK: - MediaInfo
 
-struct MediaInfo {
+struct MediaInfo: Identifiable, Equatable {
     var title: String
     var artist: String
     var isPlaying: Bool
     var source: MediaSource
+    
+    /// Kompozit kimlik: kaynak + başlık üzerinden eşsizlik
+    var id: String { "\(source.rawValue)_\(title)" }
+    
+    static func == (lhs: MediaInfo, rhs: MediaInfo) -> Bool {
+        lhs.source == rhs.source && lhs.title == rhs.title
+    }
 }
 
 // MARK: - MediaManager
@@ -43,6 +50,7 @@ class MediaManager: ObservableObject {
     
     @Published var mediaInfo: MediaInfo?
     @Published var lastKnownMedia: MediaInfo?
+    @Published var activeMediaList: [MediaInfo] = []
     
     // MARK: - Private Properties
     
@@ -215,6 +223,59 @@ class MediaManager: ObservableObject {
             
             self.pollQueue.asyncAfter(deadline: .now() + 0.5) {
                 self.fetchNowPlaying()
+            }
+        }
+    }
+    
+    // MARK: - Targeted Play/Pause (Hedef Bazlı — Mikser Paneli İçin)
+    
+    /// Belirli bir kaynak ve başlığa göre play/pause yapar
+    func togglePlayPause(for source: MediaSource, title: String?) {
+        pollQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            switch source {
+            case .spotify:
+                if self.isAppRunning("Spotify") {
+                    let script = """
+                    if application "Spotify" is running then
+                        tell application "Spotify" to playpause
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .appleMusic:
+                if self.isAppRunning("Music") {
+                    let script = """
+                    if application "Music" is running then
+                        tell application "Music" to playpause
+                    end if
+                    """
+                    _ = self.runAppleScript(script)
+                }
+                
+            case .browserTab:
+                self.browserTogglePlayPause(targetTitle: title)
+                
+            default:
+                self.sendMediaKeyEvent(keyType: 16)
+            }
+            
+            self.pollQueue.asyncAfter(deadline: .now() + 0.5) {
+                self.fetchNowPlaying()
+            }
+        }
+    }
+    
+    // MARK: - Set Primary Media (Kullanıcı Seçimi)
+    
+    /// Mikser panelinden seçilen medyayı birincil medya olarak atar
+    func setPrimaryMedia(_ media: MediaInfo) {
+        DispatchQueue.main.async { [weak self] in
+            self?.mediaInfo = media
+            if media.source != .mock {
+                self?.lastKnownMedia = media
             }
         }
     }
@@ -626,8 +687,25 @@ class MediaManager: ObservableObject {
         }
         
         // 4️⃣ Browser tabs (Chromium + Safari)
-        if let info = fetchFromBrowserTabs() {
-            candidates.append(info)
+        let browserInfos = fetchFromBrowserTabs()
+        candidates.append(contentsOf: browserInfos)
+        
+        // --- Çoklu Medya Listesini Güncelle ---
+        // Playing veya paused olan eşsiz medyaları activeMediaList'e kaydet
+        // mediaRemote, diğer kaynaklarla çoğu zaman duplikasyon yaratır → filtrele
+        let activeCandidates = candidates.filter { $0.source != .mock && $0.source != .mediaRemote }
+        var uniqueList: [MediaInfo] = []
+        var seenKeys = Set<String>()
+        for candidate in activeCandidates {
+            let key = candidate.id
+            if !seenKeys.contains(key) {
+                seenKeys.insert(key)
+                uniqueList.append(candidate)
+            }
+        }
+        
+        DispatchQueue.main.async { [weak self] in
+            self?.activeMediaList = uniqueList
         }
         
         // --- SON ÇALAN KAZANIR (Active Override) ---
@@ -793,7 +871,9 @@ class MediaManager: ObservableObject {
     /// JavaScript kodu: Sayfadaki tüm video/audio elementlerini tarayıp oynatma durumunu döndürür
     private let mediaDetectionJS = "(function(){ var elems = document.querySelectorAll('video, audio'); for(var i=0; i<elems.length; i++){ if(!elems[i].paused && elems[i].duration > 0) return 'PLAYING'; } if(elems.length > 0) return 'PAUSED'; return 'NO_MEDIA'; })();"
     
-    private func fetchFromBrowserTabs() -> MediaInfo? {
+    private func fetchFromBrowserTabs() -> [MediaInfo] {
+        var results: [MediaInfo] = []
+        
         let chromiumBrowsers = [
             "Google Chrome",
             "Brave Browser",
@@ -805,32 +885,32 @@ class MediaManager: ObservableObject {
         // 🛡️ Sadece açık olan tarayıcıları sorgula
         for appName in chromiumBrowsers {
             guard isAppRunning(appName) else { continue }
-            if let info = fetchFromChromiumBrowser(appName: appName) {
-                return info
-            }
+            let infos = fetchFromChromiumBrowser(appName: appName)
+            results.append(contentsOf: infos)
         }
         
         // Safari (farklı AppleScript API)
-        if isAppRunning("Safari"), let info = fetchFromSafari() {
-            return info
+        if isAppRunning("Safari") {
+            let infos = fetchFromSafari()
+            results.append(contentsOf: infos)
         }
         
-        return nil
+        return results
     }
     
     // MARK: - Chromium Browsers (Chrome, Brave, Edge, Arc, Opera)
     
     /// Tüm pencere ve sekmeleri gezerek JavaScript ile HTML5 media durumunu kontrol eder.
-    /// Playing bulursa o sekmenin başlığını döndürür.
-    private func fetchFromChromiumBrowser(appName: String) -> MediaInfo? {
-        // Tüm sekmeleri tara, playing olan varsa title + state döndür
+    /// Playing veya Paused olan tüm sekmelerin bilgilerini toplar ve döndürür.
+    private func fetchFromChromiumBrowser(appName: String) -> [MediaInfo] {
         let script = """
         if application "\(appName)" is running then
             tell application "\(appName)"
                 set windowCount to count of windows
-                if windowCount is 0 then return "NO_MEDIA|||none|||NO_MEDIA"
+                if windowCount is 0 then return "NO_MEDIA"
                 
-                -- Önce playing olan sekmeyi ara
+                set foundMedia to ""
+                
                 repeat with w from 1 to windowCount
                     set tabCount to count of tabs of window w
                     repeat with t from 1 to tabCount
@@ -839,53 +919,46 @@ class MediaManager: ObservableObject {
                             set jsResult to execute currentTab javascript "\(mediaDetectionJS)"
                             if jsResult is "PLAYING" then
                                 set tabTitle to title of currentTab
-                                return tabTitle & "|||" & "PLAYING"
-                            end if
-                        end try
-                    end repeat
-                end repeat
-                
-                -- Playing yok, paused olan var mı?
-                repeat with w from 1 to windowCount
-                    set tabCount to count of tabs of window w
-                    repeat with t from 1 to tabCount
-                        set currentTab to tab t of window w
-                        try
-                            set jsResult to execute currentTab javascript "\(mediaDetectionJS)"
-                            if jsResult is "PAUSED" then
+                                set foundMedia to foundMedia & tabTitle & "|||PLAYING###"
+                            else if jsResult is "PAUSED" then
                                 set tabTitle to title of currentTab
-                                return tabTitle & "|||" & "PAUSED"
+                                set foundMedia to foundMedia & tabTitle & "|||PAUSED###"
                             end if
                         end try
                     end repeat
                 end repeat
                 
-                return "NO_MEDIA|||none|||NO_MEDIA"
+                if foundMedia is not "" then
+                    return foundMedia
+                else
+                    return "NO_MEDIA"
+                end if
             end tell
         else
-            return "NOT_RUNNING|||none|||NOT_RUNNING"
+            return "NOT_RUNNING"
         end if
         """
         
         guard let result = runAppleScript(script),
               !result.contains("NOT_RUNNING"),
               !result.contains("NO_MEDIA") else {
-            return nil
+            return []
         }
         
-        return parseBrowserJSResult(result)
+        return parseBrowserJSResults(result)
     }
     
     // MARK: - Safari (Farklı AppleScript API — do JavaScript)
     
-    private func fetchFromSafari() -> MediaInfo? {
+    private func fetchFromSafari() -> [MediaInfo] {
         let script = """
         if application "Safari" is running then
             tell application "Safari"
                 set windowCount to count of windows
-                if windowCount is 0 then return "NO_MEDIA|||NO_MEDIA"
+                if windowCount is 0 then return "NO_MEDIA"
                 
-                -- Önce playing olan sekmeyi ara
+                set foundMedia to ""
+                
                 repeat with w from 1 to windowCount
                     set tabCount to count of tabs of window w
                     repeat with t from 1 to tabCount
@@ -894,63 +967,66 @@ class MediaManager: ObservableObject {
                             set jsResult to do JavaScript "\(mediaDetectionJS)" in currentTab
                             if jsResult is "PLAYING" then
                                 set tabTitle to name of currentTab
-                                return tabTitle & "|||" & "PLAYING"
-                            end if
-                        end try
-                    end repeat
-                end repeat
-                
-                -- Playing yok, paused olan var mı?
-                repeat with w from 1 to windowCount
-                    set tabCount to count of tabs of window w
-                    repeat with t from 1 to tabCount
-                        set currentTab to tab t of window w
-                        try
-                            set jsResult to do JavaScript "\(mediaDetectionJS)" in currentTab
-                            if jsResult is "PAUSED" then
+                                set foundMedia to foundMedia & tabTitle & "|||PLAYING###"
+                            else if jsResult is "PAUSED" then
                                 set tabTitle to name of currentTab
-                                return tabTitle & "|||" & "PAUSED"
+                                set foundMedia to foundMedia & tabTitle & "|||PAUSED###"
                             end if
                         end try
                     end repeat
                 end repeat
                 
-                return "NO_MEDIA|||NO_MEDIA"
+                if foundMedia is not "" then
+                    return foundMedia
+                else
+                    return "NO_MEDIA"
+                end if
             end tell
         else
-            return "NOT_RUNNING|||NOT_RUNNING"
+            return "NOT_RUNNING"
         end if
         """
         
         guard let result = runAppleScript(script),
               !result.contains("NOT_RUNNING"),
               !result.contains("NO_MEDIA") else {
-            return nil
+            return []
         }
         
-        return parseBrowserJSResult(result)
+        return parseBrowserJSResults(result)
     }
     
     // MARK: - Browser Result Parser
     
-    /// "Tab Title|||PLAYING" veya "Tab Title|||PAUSED" formatını parse eder
-    private func parseBrowserJSResult(_ result: String) -> MediaInfo? {
-        let parts = result.components(separatedBy: "|||")
-        guard parts.count >= 2 else { return nil }
+    /// "Tab Title|||PLAYING###Tab 2|||PAUSED###" formatını parse eder ve diziye çevirir
+    private func parseBrowserJSResults(_ result: String) -> [MediaInfo] {
+        var mediaList: [MediaInfo] = []
         
-        let rawTitle = parts[0]
-        let state = parts[1]
-        let isPlaying = (state == "PLAYING")
+        let tabResults = result.components(separatedBy: "###")
         
-        // Tab başlığından şarkı/sanatçı bilgisini çıkar
-        let parsed = parseMediaTitle(rawTitle)
+        for tabResult in tabResults {
+            if tabResult.isEmpty { continue }
+            
+            let parts = tabResult.components(separatedBy: "|||")
+            guard parts.count >= 2 else { continue }
+            
+            let rawTitle = parts[0]
+            let state = parts[1]
+            let isPlaying = (state == "PLAYING")
+            
+            // Tab başlığından şarkı/sanatçı bilgisini çıkar
+            let parsed = parseMediaTitle(rawTitle)
+            
+            let info = MediaInfo(
+                title: parsed.title,
+                artist: parsed.artist,
+                isPlaying: isPlaying,
+                source: .browserTab
+            )
+            mediaList.append(info)
+        }
         
-        return MediaInfo(
-            title: parsed.title,
-            artist: parsed.artist,
-            isPlaying: isPlaying,
-            source: .browserTab
-        )
+        return mediaList
     }
     
     /// Tab başlığından şarkı adı ve sanatçı bilgisini ayıklar

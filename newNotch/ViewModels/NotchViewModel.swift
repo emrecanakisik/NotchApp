@@ -17,6 +17,7 @@ enum NotchState {
     case mediaCollapsed
     case mediaPausing         // Müzik durdu ama henüz kapanmıyor (2 sn grace period)
     case mediaPlayerActive    // Tam açık interaktif player (tıklama ile)
+    case multiMediaListActive // Çoklu medya mikser paneli
     case progress
     case notification
 }
@@ -30,6 +31,7 @@ class NotchViewModel: ObservableObject {
     @Published var currentState: NotchState = .idle
     @Published var mediaInfo: MediaInfo?
     @Published var lastKnownMedia: MediaInfo?
+    @Published var activeMediaList: [MediaInfo] = []
     
     // MARK: - Managers
     
@@ -58,39 +60,44 @@ class NotchViewModel: ObservableObject {
     
     func notchWidth(for state: NotchState) -> CGFloat {
         switch state {
-        case .idle:               return 220
-        case .idleExpanded:       return 350
-        case .mediaExpanded:      return 350
-        case .mediaCollapsed:     return 305
-        case .mediaPausing:       return 305
-        case .mediaPlayerActive:  return 350
-        case .progress:           return 305
-        case .notification:       return 350
+        case .idle:                  return 220
+        case .idleExpanded:          return 350
+        case .mediaExpanded:         return 350
+        case .mediaCollapsed:        return 305
+        case .mediaPausing:          return 305
+        case .mediaPlayerActive:     return 350
+        case .multiMediaListActive:  return 350
+        case .progress:              return 305
+        case .notification:          return 350
         }
     }
     
     func notchHeight(for state: NotchState) -> CGFloat {
         switch state {
-        case .idle:               return 38
-        case .idleExpanded:       return 85
-        case .mediaExpanded:      return 85
-        case .mediaCollapsed:     return 38
-        case .mediaPausing:       return 38
-        case .mediaPlayerActive:  return 200
-        case .progress:           return 42
-        case .notification:       return 85
+        case .idle:                  return 38
+        case .idleExpanded:          return 85
+        case .mediaExpanded:         return 85
+        case .mediaCollapsed:        return 38
+        case .mediaPausing:          return 38
+        case .mediaPlayerActive:     return 200
+        case .multiMediaListActive:
+            let dynamicHeight = 40 + CGFloat(activeMediaList.count) * 50
+            return min(dynamicHeight, 300)
+        case .progress:              return 42
+        case .notification:          return 85
         }
     }
     
     func notchCornerRadius(for state: NotchState) -> CGFloat {
         switch state {
-        case .idle:               return 12  // Fiziksel çentik birebir
+        case .idle:               return 12
         case .mediaCollapsed, .mediaPausing:
-                                  return 12  // Yükseklik değişmediği için kavis aynı kalmalı
+                                  return 12
         case .idleExpanded, .mediaExpanded, .notification:
                                   return 18
-        case .mediaPlayerActive:  return 26
-        case .progress:           return 14  // height 42 -> padding 4 -> 12 + 2 veya 4
+        case .mediaPlayerActive, .multiMediaListActive:
+                                  return 26
+        case .progress:           return 14
         }
     }
     
@@ -101,7 +108,8 @@ class NotchViewModel: ObservableObject {
                                   return 6
         case .idleExpanded, .mediaExpanded, .notification:
                                   return 10
-        case .mediaPlayerActive:  return 12
+        case .mediaPlayerActive, .multiMediaListActive:
+                                  return 12
         case .progress:           return 8
         }
     }
@@ -137,6 +145,11 @@ class NotchViewModel: ObservableObject {
         mediaManager.$lastKnownMedia
             .receive(on: DispatchQueue.main)
             .assign(to: &$lastKnownMedia)
+        
+        // activeMediaList binding
+        mediaManager.$activeMediaList
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$activeMediaList)
     }
     
     // MARK: - Media State Machine
@@ -169,10 +182,10 @@ class NotchViewModel: ObservableObject {
                 return
             }
             
-            // mediaPlayerActive açıkken state değiştirme — sadece veriyi güncelle
-            if currentState == .mediaPlayerActive {
+            // mediaPlayerActive veya multiMediaListActive açıkken state değiştirme — sadece veriyi güncelle
+            if currentState == .mediaPlayerActive || currentState == .multiMediaListActive {
                 if trackChanged {
-                    // Şarkı değişti — player açık kalsın, auto-close timer sıfırla
+                    // Şarkı değişti — panel açık kalsın, auto-close timer sıfırla
                     resetPlayerAutoCloseTimer()
                 }
                 return
@@ -187,8 +200,8 @@ class NotchViewModel: ObservableObject {
             // ⏸ Müzik duraklatıldı
             cancelCollapseTimer()
             
-            // Player açıksa açık kalsın (kullanıcı bilerek açtı)
-            if currentState == .mediaPlayerActive {
+            // Player veya mikser açıksa açık kalsın (kullanıcı bilerek açtı)
+            if currentState == .mediaPlayerActive || currentState == .multiMediaListActive {
                 return
             }
             
@@ -217,7 +230,14 @@ class NotchViewModel: ObservableObject {
     func openMediaPlayer() {
         guard mediaInfo != nil else { return }
         cancelAllTimers()
-        currentState = .mediaPlayerActive
+        
+        // Çoklu medya varsa mikser panelini aç, yoksa tek player
+        if mediaManager.activeMediaList.count > 1 {
+            currentState = .multiMediaListActive
+        } else {
+            currentState = .mediaPlayerActive
+        }
+        
         // Fare zaten üzerindeyse timer başlatma
         if !isHovered {
             startPlayerAutoCloseTimer()
@@ -233,6 +253,24 @@ class NotchViewModel: ObservableObject {
             currentState = .mediaPausing
             startPauseDismissTimer()
         }
+    }
+    
+    // MARK: - Select Primary Media (Mikser Panelinden Seçim)
+    
+    /// Mikser panelinden bir medya seçildiğinde birincil medya olarak atar ve DJ Masası'na geçer
+    func selectPrimaryMedia(_ media: MediaInfo) {
+        mediaManager.setPrimaryMedia(media)
+        cancelAllTimers()
+        currentState = .mediaPlayerActive
+        if !isHovered {
+            startPlayerAutoCloseTimer()
+        }
+    }
+    
+    /// Hedefli play/pause — mikser panelindeki mini buton için
+    func togglePlayPause(for source: MediaSource, title: String?) {
+        mediaManager.togglePlayPause(for: source, title: title)
+        resetPlayerAutoCloseTimer()
     }
     
     // MARK: - Idle Expanded Toggle
@@ -306,7 +344,7 @@ class NotchViewModel: ObservableObject {
         
         let work = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            if self.currentState == .mediaPlayerActive {
+            if self.currentState == .mediaPlayerActive || self.currentState == .multiMediaListActive {
                 self.closeMediaPlayer()
             }
         }
@@ -368,7 +406,7 @@ class NotchViewModel: ObservableObject {
             switch currentState {
             case .idleExpanded:
                 startHoverDismissTimer(targetState: .idle)
-            case .mediaPlayerActive:
+            case .mediaPlayerActive, .multiMediaListActive:
                 startHoverDismissTimer(targetState: mediaInfo?.isPlaying == true ? .mediaCollapsed : .mediaPausing)
             default:
                 break

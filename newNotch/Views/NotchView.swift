@@ -17,6 +17,7 @@ struct NotchView: View {
     @State private var showPausingIndicators = false
     @State private var showPlayerContent = false
     @State private var showIdleExpandedContent = false
+    @State private var showMultiMediaListContent = false
     
     /// Hover efekti
     @State private var isHovered = false
@@ -30,6 +31,7 @@ struct NotchView: View {
     var body: some View {
         let isInteractive = viewModel.currentState == .idleExpanded
             || viewModel.currentState == .mediaPlayerActive
+            || viewModel.currentState == .multiMediaListActive
         let safeZonePadding: CGFloat = isInteractive ? 40 : 0
         
 
@@ -90,6 +92,18 @@ struct NotchView: View {
                         .transition(.opacity)
                         .frame(
                             width: viewModel.notchWidth(for: shapeState) - 24,
+                            height: viewModel.notchHeight(for: shapeState) - physicalNotchHeight - 6,
+                            alignment: .top
+                        )
+                        .padding(.top, physicalNotchHeight + 4)
+                }
+                
+                // Çoklu Medya Mikser Paneli
+                if viewModel.currentState == .multiMediaListActive, showMultiMediaListContent {
+                    multiMediaListView
+                        .transition(.opacity)
+                        .frame(
+                            width: viewModel.notchWidth(for: shapeState) - 28,
                             height: viewModel.notchHeight(for: shapeState) - physicalNotchHeight - 6,
                             alignment: .top
                         )
@@ -194,6 +208,7 @@ struct NotchView: View {
             showPausingIndicators = false
             showPlayerContent = false
             showIdleExpandedContent = false
+            showMultiMediaListContent = false
         }
     }
     
@@ -219,6 +234,10 @@ struct NotchView: View {
         case .idleExpanded:
             withAnimation(.easeIn(duration: 0.25).delay(delay)) {
                 showIdleExpandedContent = true
+            }
+        case .multiMediaListActive:
+            withAnimation(.easeIn(duration: 0.3).delay(delay)) {
+                showMultiMediaListContent = true
             }
         default:
             break // idle, progress, notification → içerik yok
@@ -254,6 +273,8 @@ struct NotchView: View {
         case .idleExpanded:
             viewModel.toggleIdleExpanded()
         case .mediaPlayerActive:
+            viewModel.closeMediaPlayer()
+        case .multiMediaListActive:
             viewModel.closeMediaPlayer()
         default:
             break // Diğer state'lerde tap, kendi iç butonları tarafından yönetilir
@@ -351,6 +372,85 @@ struct NotchView: View {
             .frame(width: 24, height: 24)
         }
         .padding(.horizontal, 4)
+    }
+    
+    // MARK: - Multi-Media List View (Mikser Paneli)
+    
+    private var multiMediaListView: some View {
+        ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 6) {
+                ForEach(viewModel.activeMediaList) { media in
+                    HStack(spacing: 10) {
+                        // Kaynak ikonu
+                        Image(systemName: iconForSource(media.source))
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundColor(colorForSource(media.source))
+                            .frame(width: 24, height: 24)
+                        
+                        // Şarkı/Video adı + Sanatçı
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(media.title)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            
+                            Text(media.artist)
+                                .font(.system(size: 9, weight: .regular))
+                                .foregroundColor(.white.opacity(0.5))
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        
+                        // Mini Play/Pause butonu
+                        Button(action: {
+                            viewModel.togglePlayPause(for: media.source, title: media.title)
+                        }) {
+                            Image(systemName: media.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundColor(.white.opacity(0.85))
+                                .frame(width: 28, height: 28)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                        .fill(Color.white.opacity(0.1))
+                                )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color.white.opacity(0.05))
+                    )
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        viewModel.selectPrimaryMedia(media)
+                    }
+                }
+            }
+        }
+    }
+    
+    // MARK: - Source Helpers
+    
+    private func iconForSource(_ source: MediaSource) -> String {
+        switch source {
+        case .spotify:     return "music.note"
+        case .appleMusic:  return "music.quarternote.3"
+        case .browserTab:  return "globe"
+        case .mediaRemote: return "antenna.radiowaves.left.and.right"
+        case .mock:        return "music.note"
+        }
+    }
+    
+    private func colorForSource(_ source: MediaSource) -> Color {
+        switch source {
+        case .spotify:     return .green
+        case .appleMusic:  return .pink
+        case .browserTab:  return .blue
+        case .mediaRemote: return .gray
+        case .mock:        return .gray
+        }
     }
     
     // MARK: - Collapsed Media View (tıklanabilir → player açılır)
