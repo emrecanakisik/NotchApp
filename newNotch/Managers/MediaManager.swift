@@ -724,13 +724,11 @@ class MediaManager: ObservableObject {
             return
         }
         
-        // Hiçbir kaynak bulunamadı → mock moda geç
-        if !useMockData {
-            useMockData = true
-            DispatchQueue.main.async { [weak self] in
-                self?.startMockMode()
-            }
-        }
+        // Hiçbir kaynak bulunamadı → Medyayı temizle
+                DispatchQueue.main.async { [weak self] in
+                    self?.mediaInfo = nil
+                    self?.activeMediaList = []
+                }
     }
     
     private func updateMediaInfo(_ info: MediaInfo) {
